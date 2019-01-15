@@ -18,24 +18,35 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	mrand "math/rand"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/httputil"
+	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -72,6 +83,16 @@ var (
 	blockPrefetchInterruptMeter = metrics.NewRegisteredMeter("chain/prefetch/interrupts", nil)
 
 	errInsertionInterrupted = errors.New("insertion is interrupted")
+	// Uncle block reward = (Uncle block number + 8 - Block number) * Block reward / 8
+	// Reference reward = Block reward / 32
+	FrontierUncleBlockRewardFactor       = new(big.Int).Quo(ethash.FrontierBlockReward, big.NewInt(8))
+	FrontierBlockReferenceReward         = new(big.Int).Quo(ethash.FrontierBlockReward, big.NewInt(32))
+	ByzantiumUncleBlockRewardFactor      = new(big.Int).Quo(ethash.ByzantiumBlockReward, big.NewInt(8))
+	ByzantiumBlockReferenceReward        = new(big.Int).Quo(ethash.ByzantiumBlockReward, big.NewInt(32))
+	ConstantinopleUncleBlockRewardFactor = new(big.Int).Quo(ethash.ConstantinopleBlockReward, big.NewInt(8))
+	ConstantinopleBlockReferenceReward   = new(big.Int).Quo(ethash.ConstantinopleBlockReward, big.NewInt(32))
+
+	UncleDifficultyMaximum = big.NewInt(5703497331004136)
 )
 
 const (
@@ -105,6 +126,26 @@ const (
 	//  The following incompatible database changes were added:
 	//    * Use freezer as the ancient database to maintain all ancient data
 	BlockChainVersion uint64 = 7
+	DefaultGasPrice = params.GWei
+	GenesisBlockTimestamp = 1438226773
+
+	ContractAddressENSRegistrar = "0x6090a6e47849629b7245dfa1ca21d94cd15878ef"
+	TopicHashTransfer           = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+	TopicHashOwnerChanged       = "0xa2ea9883a321a3e97b8266c2b078bfeec6d50c711ed71f874a90d500ae2eaf36"
+	TopicHashENSStartAuction    = "0x87e97e825a1d1fa0c54e1d36c7506c1dea8b1efd451fe68b000cf96f7cf40003"
+	TopicHashENSUnsealBid       = "0x7b6c4b278d165a6b33958f8ea5dfb00c8c9d4d0acf1985bef5d10786898bc3e7"
+	TopicHashENSNewBid          = "0xb556ff269c1b6714f432c36431e2041d28436a73b6c3f19c021827bbdc6bfc29"
+	TopicHashENSFinalizeAuction = "0x0f0c27adfd84b60b6f456b0e87cdccb1e5fb9603991588d87fa99f5b6b61e670"
+	TopicHashENSBidRevealed     = "0x7b6c4b278d165a6b33958f8ea5dfb00c8c9d4d0acf1985bef5d10786898bc3e7"
+	TopicHashENSTransfer        = "0xce0457fe73731f824cc272376169235128c118b49d344817417c6d108d155e82"
+
+	TransferParamFormatFrom               = "{\"to\":\"0x%s\", \"data\":\"0x70a08231000000000000000000000000%s\"}"
+	TransferParamFormatTo                 = "{\"to\":\"0x%s\", \"data\":\"0x70a08231000000000000000000000000%s\"}"
+	TransferParamFormatTokenName          = "{\"to\":\"0x%s\", \"data\":\"0x06fdde03\"}"
+	TransferParamFormatTokenSymbol        = "{\"to\":\"0x%s\", \"data\":\"0x95d89b41\"}"
+	TransferParamFormatTokenDecimalLength = "{\"to\":\"0x%s\", \"data\":\"0x313ce567\"}"
+	TransferParamFormatTokenTotalSupply   = "{\"to\":\"0x%s\", \"data\":\"0x18160ddd\"}"
+	TransferParamFormatTokenOwner         = "{\"to\":\"0x%s\", \"data\":\"0x8da5cb5b\"}"
 )
 
 // CacheConfig contains the configuration values for the trie caching/pruning
@@ -1645,7 +1686,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		}
 		// Process block using the parent state as reference point
 		substart := time.Now()
-		receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
+		receipts, logs, traceReses, usedGas, err := bc.processor.ProcessWithTrace(block, statedb, bc.vmConfig)
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)
@@ -1693,6 +1734,12 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 
 		blockWriteTimer.Update(time.Since(substart) - statedb.AccountCommits - statedb.StorageCommits)
 		blockInsertTimer.UpdateSince(start)
+
+		signer := types.MakeSigner(bc.chainConfig, block.Number())
+		err = bc.WriteDataToKafka(block, receipts, signer, traceReses)
+		if err != nil {
+			log.Warn("Send data to kafka failed", "number", block.Number(), "hash", block.Hash())
+		}
 
 		switch status {
 		case CanonStatTy:
@@ -1746,6 +1793,821 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 }
 
 // insertSideChain is called when an import batch hits upon a pruned ancestor
+func vmBlockHash(n uint64) common.Hash {
+	return common.BytesToHash(crypto.Keccak256([]byte(big.NewInt(int64(n)).String())))
+}
+
+// CallArgs represents the arguments for a call.
+type CallArgs struct {
+	From     common.Address  `json:"from"`
+	To       *common.Address `json:"to"`
+	Gas      hexutil.Uint64  `json:"gas"`
+	GasPrice hexutil.Big     `json:"gasPrice"`
+	Value    hexutil.Big     `json:"value"`
+	Data     hexutil.Bytes   `json:"data"`
+}
+
+func (bc *BlockChain) doCall(ctx context.Context, state *state.StateDB, args *CallArgs, vmCfg vm.Config, timeout time.Duration) ([]byte, uint64, bool, error) {
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	// Set default gas & gas price if none were set
+	gas, gasPrice := uint64(args.Gas), args.GasPrice.ToInt()
+	if gas == 0 {
+		gas = math.MaxUint64 / 2
+	}
+	if gasPrice.Sign() == 0 {
+		gasPrice = new(big.Int).SetUint64(DefaultGasPrice)
+	}
+
+	// Create new call message
+	msg := types.NewMessage(common.Address{}, args.To, 0, args.Value.ToInt(), gas, gasPrice, args.Data, false)
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	// Get a new instance of the EVM.
+	state.SetBalance(msg.From(), math.MaxBig256)
+	vmError := func() error { return nil }
+
+	nc := NewEVMContext(msg, bc.CurrentHeader(), bc, nil)
+	evm := vm.NewEVM(nc, state, bc.chainConfig, vmCfg)
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	// Setup the gas pool (also for unmetered requests)
+	// and apply the message.
+	gp := new(GasPool).AddGas(math.MaxUint64)
+	res, gas, failed, err := ApplyMessage(evm, msg, gp)
+	if err := vmError(); err != nil {
+		return nil, 0, false, err
+	}
+	return res, gas, failed, err
+}
+
+func (bc *BlockChain) WriteDataToKafka(blk *types.Block, rcps types.Receipts, signer types.Signer, traceResult []*types.TraceResult) error {
+	parentBlk := bc.GetBlockByHash(blk.ParentHash())
+	var statedb *state.StateDB
+	if blk.Number().Int64() != 0 && traceResult == nil {
+		statedb, _ = bc.StateAt(parentBlk.Root())
+	} else {
+		statedb, _ = bc.State()
+	}
+
+	log.Debug("Current block", "number", blk.NumberU64())
+
+	b := new(httputils.BlockKafka)
+	b.Uncles = make([]*httputils.Uncle, 0)
+	b.Transactions = make([]*httputils.Transaction, 0)
+	b.InternalTransactions = make([]*httputils.InternalTransaction, 0)
+	b.TokenTransactions = make([]*httputils.TokenTransaction, 0)
+	b.Tokens = make([]*httputils.Token, 0)
+	b.ENSes = make([]*httputils.ENS, 0)
+
+	// Block
+	height := blk.Number().Int64()
+	totalFee := new(big.Int)
+	singleFee := new(big.Int)
+
+	b.Block = new(httputils.Block)
+
+	b.Block.Height = height
+	b.Block.Timestamp = int64(blk.Time())
+
+	b.Block.Hash = blk.Hash().String()
+	b.Block.ParentHash = blk.Header().ParentHash.String()
+	b.Block.SHA3Uncles = blk.Header().UncleHash.String()
+	b.Block.Miner = blk.Coinbase().String()
+	b.Block.Difficulty = blk.Difficulty()
+	b.Block.ExtraData = hexutil.Encode(blk.Header().Extra)
+	b.Block.LogsBloom = blk.Bloom()
+	b.Block.TransactionRoot = blk.Header().TxHash.String()
+	b.Block.StateRoot = blk.Root().String()
+	b.Block.ReceiptsRoot = blk.Header().ReceiptHash.String()
+	b.Block.GasUsed = blk.GasUsed()
+	b.Block.GasLimit = blk.Header().GasLimit
+	b.Block.Nonce = hexutil.EncodeUint64(blk.Nonce())
+	b.Block.MixHash = blk.MixDigest().String()
+
+	if blk.Number().Int64() != 0 {
+		b.Block.TotalDifficulty = new(big.Int).Add(rawdb.ReadTd(bc.db, blk.ParentHash(), blk.NumberU64()-1), blk.Difficulty())
+		b.Block.MinerBalance = statedb.GetBalance(blk.Coinbase())
+	} else {
+		b.Block.TotalDifficulty = blk.Difficulty()
+	}
+	b.Block.Size = int64(blk.Size())
+
+	// Uncles
+	uncles := make([]*httputils.Uncle, 0)
+	if len(blk.Uncles()) > 0 {
+		for _, uncle := range blk.Uncles() {
+			item := new(httputils.Uncle)
+			item.Height = uncle.Number.Int64()
+			item.Timestamp = int64(uncle.Time)
+			item.Hash = uncle.Hash().String()
+			item.ParentHash = uncle.ParentHash.String()
+			item.SHA3Uncles = uncle.UncleHash.String()
+			item.Miner = uncle.Coinbase.String()
+			item.MinerBalance = statedb.GetBalance(uncle.Coinbase)
+			fmt.Printf("uncle difficulty: %s\n", uncle.Difficulty.String())
+			if uncle.Difficulty.Cmp(big.NewInt(-1)) < 0 || uncle.Difficulty.Cmp(UncleDifficultyMaximum) > 0 {
+				log.Warn("Invalid uncle difficulty", "number", uncle.Number, "hash", uncle.Hash(), "difficulty", uncle.Difficulty.String())
+				continue
+			}
+			item.Difficulty = uncle.Difficulty
+			item.ExtraData = hexutil.Encode(uncle.Extra)
+			item.LogsBloom = uncle.Bloom
+			item.TransactionRoot = uncle.TxHash.String()
+			item.StateRoot = uncle.Root.String()
+			item.ReceiptsRoot = uncle.ReceiptHash.String()
+			item.GasUsed = uncle.GasUsed
+			item.GasLimit = uncle.GasLimit
+			item.Nonce = hexutil.EncodeUint64(uncle.Nonce.Uint64())
+			item.MixHash = uncle.MixDigest.String()
+			item.TotalDifficulty = new(big.Int).Add(rawdb.ReadTd(bc.db, uncle.ParentHash, uncle.Number.Uint64()-1), uncle.Difficulty)
+			item.Size = int64(uncle.Size())
+			item.BlockHeight = height
+
+			var x, y *big.Int
+			x = new(big.Int).SetInt64(item.Height + 8 - item.BlockHeight)
+			if item.BlockHeight < params.MainnetChainConfig.ByzantiumBlock.Int64() {
+				y = FrontierUncleBlockRewardFactor
+			} else if item.BlockHeight < params.MainnetChainConfig.ConstantinopleBlock.Int64() {
+				y = ByzantiumUncleBlockRewardFactor
+			} else {
+				y = ConstantinopleUncleBlockRewardFactor
+			}
+			item.Reward = new(big.Int).Mul(x, y)
+
+			uncles = append(uncles, item)
+		}
+	}
+	b.Uncles = uncles
+
+	// Transactions
+	if blk.Transactions().Len() > 0 {
+		for i, transaction := range blk.Transactions() {
+			// Transaction
+			item := new(httputils.Transaction)
+			item.Hash = transaction.Hash().String()
+			item.BlockHeight = height
+
+			msg, err := transaction.AsMessage(signer)
+			if err != nil {
+				log.Warn("Create signer failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+				continue
+			}
+
+			item.From = msg.From().String()
+			item.FromBalance = statedb.GetBalance(msg.From())
+			item.Timestamp = int64(blk.Time())
+			item.TxBlockIndex = i
+			if transaction.To() != nil {
+				item.To = msg.To().String()
+				item.ToBalance = statedb.GetBalance(*msg.To())
+				// General transaction, tx.Type=1 for contract transaction
+				item.Type = 2
+
+				// ens
+				if strings.ToLower(transaction.To().String()) == ContractAddressENSRegistrar {
+					enses, err := bc.extractENS(item, rcps[i].Logs)
+					if err != nil {
+						log.Warn("Extract ens failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+						continue
+					}
+					b.ENSes = append(b.ENSes, enses...)
+				}
+			} else { // contract create tx
+				item.Type = 0 //tx for create contract
+				item.To = ""
+				item.ContractAddress = rcps[i].ContractAddress.String()
+				item.ToBalance = statedb.GetBalance(rcps[i].ContractAddress)
+			}
+
+			item.Value = msg.Value()
+			item.GasNumber = transaction.Gas()
+			item.GasPrice = transaction.GasPrice().Uint64()
+			item.Nonce = transaction.Nonce()
+			v, r, s := transaction.RawSignatureValues()
+			item.V = hexutil.EncodeBig(v)
+			item.R = hexutil.EncodeBig(r)
+			item.S = hexutil.EncodeBig(s)
+			item.Status = rcps[i].Status
+			item.CumulativeGasUsed = rcps[i].CumulativeGasUsed
+			item.GasUsed = rcps[i].GasUsed
+
+			item.LogsBloom = hexutil.EncodeBig(rcps[i].Bloom.Big())
+			item.Root = hexutil.Encode(rcps[i].PostState)
+			item.LogLen = len(rcps[i].Logs)
+			item.TxSize = int(transaction.Size())
+
+			b.Transactions = append(b.Transactions, item)
+
+			singleFee.SetUint64(rcps[i].GasUsed * blk.Transactions()[i].GasPrice().Uint64())
+			totalFee = new(big.Int).Add(totalFee, singleFee)
+
+			logsList := rcps[i].Logs
+
+			// Token transactions
+			if len(logsList) > 0 {
+				ctx := context.Background()
+				for _, logItem := range logsList {
+					topics := logItem.Topics
+					tokenTransaction := new(httputils.TokenTransaction)
+					if len(topics) > 2 {
+						if topics[0].String() == TopicHashTransfer {
+							tokenTransaction.BlockHeight = height
+							tokenTransaction.From = topics[1].String()[26:]
+							if len(tokenTransaction.From) > 40 {
+								tokenTransaction.From = tokenTransaction.From[len(tokenTransaction.From)-40:]
+							}
+							tokenTransaction.To = topics[2].String()[26:]
+							if len(tokenTransaction.To) > 40 {
+								tokenTransaction.To = tokenTransaction.To[len(tokenTransaction.To)-40:]
+							}
+
+							tokenTransaction.IsRemoved = logItem.Removed
+							tokenTransaction.LogIndex = int64(logItem.Index)
+							tokenTransaction.ParentTxHash = logItem.TxHash.String()
+							tokenTransaction.ParentTxIndex = int64(logItem.TxIndex)
+							tokenTransaction.Timestamp = int64(blk.Time())
+							tokenTransaction.TokenAddress = logItem.Address.String()[2:]
+							tokenTransaction.Value = new(big.Int).SetBytes(logItem.Data)
+
+							fromParamStr := fmt.Sprintf(TransferParamFormatFrom, tokenTransaction.TokenAddress, tokenTransaction.From)
+							toParamStr := fmt.Sprintf(TransferParamFormatTo, tokenTransaction.TokenAddress, tokenTransaction.To)
+
+							fromArgs := new(CallArgs)
+							err = json.Unmarshal([]byte(fromParamStr), fromArgs)
+							if err != nil {
+								log.Warn("Parse token transaction from_balance failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+								continue
+							}
+							res, _, _, err := bc.doCall(ctx, statedb, fromArgs, vm.Config{}, 5*time.Second)
+							if err != nil {
+								log.Warn("Call token transaction from_balance failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+								continue
+							}
+							tokenTransaction.FromBalance = big.NewInt(0)
+							tokenTransaction.FromBalance.SetBytes(res)
+							if tokenTransaction.FromBalance.Cmp(big.NewInt(0)) <= 0 {
+								tokenTransaction.FromBalance.SetInt64(0)
+							}
+
+							toArgs := new(CallArgs)
+							err = json.Unmarshal([]byte(toParamStr), toArgs)
+							if err != nil {
+								log.Warn("Parse token transaction to_balance failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+								continue
+							}
+							res, _, _, err = bc.doCall(ctx, statedb, toArgs, vm.Config{}, 5*time.Second)
+							if err != nil {
+								log.Warn("Call token transaction to_balance failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+								continue
+							}
+							tokenTransaction.ToBalance = big.NewInt(0)
+							tokenTransaction.ToBalance.SetBytes(res)
+							if tokenTransaction.ToBalance.Cmp(big.NewInt(0)) <= 0 {
+								tokenTransaction.ToBalance.SetInt64(0)
+							}
+
+							b.TokenTransactions = append(b.TokenTransactions, tokenTransaction)
+
+							// Token
+							latestStateDB, err := bc.State()
+							if err != nil {
+								log.Warn("Get latest statedb failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+								continue
+							}
+
+							token, err := bc.GetToken(ctx, latestStateDB, tokenTransaction.TokenAddress)
+							if err != nil {
+								log.Warn("Get token failed", "number", height, "transaction", transaction.Hash(), "token_adderss", tokenTransaction.TokenAddress, "msg", err)
+								continue
+							}
+
+							b.Tokens = append(b.Tokens, token)
+						}
+					}
+				}
+			}
+
+			// Internal transaction
+			var internalTransactionData string
+			if traceResult == nil {
+				log.Debug("Trace result not exist")
+				origin, _ := signer.Sender(transaction)
+				ctx := vm.Context{
+					CanTransfer: CanTransfer,
+					Transfer:    Transfer,
+					Origin:      origin,
+					GetHash:     vmBlockHash,
+					Coinbase:    blk.Coinbase(),
+					BlockNumber: blk.Number(),
+					Time:        big.NewInt(int64(blk.Time())),
+					Difficulty:  blk.Difficulty(),
+					GasLimit:    blk.GasLimit(),
+					GasPrice:    transaction.GasPrice(),
+				}
+				// old trace for trace internal txs
+				var tracer vm.Tracer
+				if tracer, err = tracers.New("callTracer"); err != nil {
+					log.Warn("New tracer failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+					continue
+				}
+				evm := vm.NewEVM(ctx, statedb, bc.chainConfig, vm.Config{Debug: true, Tracer: tracer})
+				st := NewStateTransition(evm, msg, new(GasPool).AddGas(transaction.Gas()))
+				if _, _, _, err = st.TransitionDb(); err != nil {
+					log.Warn("New state transition failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+					continue
+				}
+				// Retrieve the trace result and compare against the etalon
+				result, err := tracer.(*tracers.Tracer).GetResult()
+				if err != nil {
+					log.Warn("Get trace result from tracer failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+					continue
+				}
+				internalTransactionData = string(result)
+			} else {
+				log.Debug("Trace result exist")
+				if len(traceResult) >= i {
+					internalTransactionData = string(traceResult[i].Result)
+				} else {
+					log.Warn("Get trace result failed", "number", height, "transaction", transaction.Hash(), "offset", i)
+					continue
+				}
+			}
+
+			internalTransaction, err := bc.extractInternalTransaction(internalTransactionData, i, item, statedb)
+			if err != nil {
+				log.Warn("Extract internal transaction failed", "number", height, "transaction", transaction.Hash(), "msg", err)
+				continue
+			}
+			b.InternalTransactions = append(b.InternalTransactions, internalTransaction...)
+		}
+
+	}
+
+	if height < params.MainnetChainConfig.ByzantiumBlock.Int64() {
+		b.Block.BlockReward = new(big.Int).Add(ethash.FrontierBlockReward, totalFee)
+		b.Block.ReferenceReward = new(big.Int).Mul(FrontierBlockReferenceReward, big.NewInt(int64(len(blk.Uncles()))))
+		b.Block.BlockReward = new(big.Int).Add(b.Block.BlockReward, b.Block.ReferenceReward)
+	} else if height < params.MainnetChainConfig.ConstantinopleBlock.Int64() {
+		b.Block.BlockReward = new(big.Int).Add(ethash.ByzantiumBlockReward, totalFee)
+		b.Block.ReferenceReward = new(big.Int).Mul(ByzantiumBlockReferenceReward, big.NewInt(int64(len(blk.Uncles()))))
+		b.Block.BlockReward = new(big.Int).Add(b.Block.BlockReward, b.Block.ReferenceReward)
+	} else {
+		b.Block.BlockReward = new(big.Int).Add(ethash.ConstantinopleBlockReward, totalFee)
+		b.Block.ReferenceReward = new(big.Int).Mul(ConstantinopleBlockReferenceReward, big.NewInt(int64(len(blk.Uncles()))))
+		b.Block.BlockReward = new(big.Int).Add(b.Block.BlockReward, b.Block.ReferenceReward)
+	}
+
+	if params.KafkaEndpoint != "" {
+//		if b.Block.Height == 1 && traceResult != nil {
+		if b.Block.Height == 1 {
+			block := bc.setupGenesisBlock()
+			if block != nil {
+				_ = bc.sendDataToKafka(block)
+				log.Info("Send data to kafka success", "number", block.Block.Height, "hash", block.Block.Hash)
+			}
+		}
+		if b.Block.Height == 0 {
+			b.Block.Timestamp = GenesisBlockTimestamp
+		}
+		err := bc.sendDataToKafka(b)
+		if err != nil {
+			return err
+		}
+	}
+	log.Info("Send data to kafka success", "number", height, "hash", blk.Hash())
+	return nil
+}
+
+func (bc *BlockChain) setupGenesisBlock() *httputils.BlockKafka {
+	genesis := bc.GetBlockByNumber(0)
+	if genesis == nil {
+		return nil
+	}
+
+	b := new(httputils.BlockKafka)
+	height := genesis.Number().Int64()
+	b.Block = new(httputils.Block)
+	b.Block.Height = height
+	b.Block.Timestamp = GenesisBlockTimestamp
+	b.Block.ParentHash = genesis.Header().ParentHash.String()
+	b.Block.SHA3Uncles = genesis.Header().UncleHash.String()
+	b.Block.Miner = genesis.Coinbase().String()
+	b.Block.Difficulty = genesis.Difficulty()
+	b.Block.ExtraData = hexutil.Encode(genesis.Header().Extra)
+	b.Block.LogsBloom = genesis.Bloom()
+	b.Block.TransactionRoot = genesis.Header().TxHash.String()
+	b.Block.StateRoot = genesis.Root().String()
+	b.Block.ReceiptsRoot = genesis.Header().ReceiptHash.String()
+	b.Block.GasUsed = genesis.GasUsed()
+	b.Block.GasLimit = genesis.Header().GasLimit
+	b.Block.Nonce = hexutil.EncodeUint64(genesis.Nonce())
+	b.Block.MixHash = genesis.MixDigest().String()
+	b.Block.Hash = genesis.Hash().String()
+	b.Block.TotalDifficulty = genesis.Difficulty()
+	b.Block.Size = int64(genesis.Size())
+	return b
+}
+
+func byteString(p []byte) string {
+	return *(*string)(unsafe.Pointer(&p))
+}
+
+func (bc *BlockChain) GetTokenName(ctx context.Context, state *state.StateDB, tokenAddr string) (string, error) {
+	paramStr := fmt.Sprintf(TransferParamFormatTokenName, tokenAddr)
+	args := new(CallArgs)
+	err := json.Unmarshal([]byte(paramStr), args)
+	if err != nil {
+		log.Error("Parse token name failed", "token", tokenAddr)
+	}
+	res, _, _, err := bc.doCall(ctx, state, args, vm.Config{}, 5*time.Second)
+	if err != nil {
+		log.Error("Call token name failed", "token", tokenAddr)
+	}
+	temp := ""
+	if len(res) > 64 {
+		temp = byteString(res[64:])
+	} else {
+		temp = byteString(res)
+	}
+	return temp, nil
+}
+
+func (bc *BlockChain) GetTokenSymbol(ctx context.Context, state *state.StateDB, tokenAddr string) (string, error) {
+	paramStr := fmt.Sprintf(TransferParamFormatTokenSymbol, tokenAddr)
+	args := new(CallArgs)
+	err := json.Unmarshal([]byte(paramStr), args)
+	if err != nil {
+		log.Error("Parse token symbol failed", "token", tokenAddr)
+	}
+	res, _, _, err := bc.doCall(ctx, state, args, vm.Config{}, 5*time.Second)
+	if err != nil {
+		log.Error("Call token symbol failed", "token", tokenAddr)
+	}
+	result := ""
+	if len(res) > 64 {
+		result = byteString(res[64:])
+	} else {
+		result = byteString(res)
+	}
+
+	return result, nil
+}
+
+func (bc *BlockChain) GetTokenDecimalLength(ctx context.Context, state *state.StateDB, tokenAddr string) (int64, error) {
+	paramStr := fmt.Sprintf(TransferParamFormatTokenDecimalLength, tokenAddr)
+	args := new(CallArgs)
+	err := json.Unmarshal([]byte(paramStr), args)
+	if err != nil {
+		log.Error("Parse token decimal length failed", "token", tokenAddr)
+	}
+	res, _, _, err := bc.doCall(ctx, state, args, vm.Config{}, 5*time.Second)
+	if err != nil {
+		log.Error("Call token decimal length failed", "token", tokenAddr)
+	}
+	temp := big.NewInt(0)
+	temp.SetBytes(res)
+
+	var decimals int64
+	decimals = temp.Int64()
+
+	return decimals, nil
+}
+
+func (bc *BlockChain) GetTokenTotalSupply(ctx context.Context, state *state.StateDB, tokenAddr string) (string, error) {
+	paramStr := fmt.Sprintf(TransferParamFormatTokenTotalSupply, tokenAddr)
+	args := new(CallArgs)
+	err := json.Unmarshal([]byte(paramStr), args)
+	if err != nil {
+		log.Error("Parse token total supply failed", "token", tokenAddr)
+	}
+	res, _, _, err := bc.doCall(ctx, state, args, vm.Config{}, 5*time.Second)
+	if err != nil {
+		log.Error("Call token total supply failed", "token", tokenAddr)
+	}
+
+	var totalSupply *big.Int
+	totalSupply = big.NewInt(0)
+	if len(res) > 2 {
+		totalSupply.SetBytes(res)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		totalSupply = new(big.Int).SetInt64(0)
+	}
+	return totalSupply.String(), nil
+}
+
+func (bc *BlockChain) GetTokenOwner(ctx context.Context, state *state.StateDB, tokenAddr string) (string, error) {
+	paramStr := fmt.Sprintf(TransferParamFormatTokenOwner, tokenAddr)
+	args := new(CallArgs)
+	err := json.Unmarshal([]byte(paramStr), args)
+	if err != nil {
+		log.Error("Parse token owner failed", "token", tokenAddr)
+	}
+	res, _, _, err := bc.doCall(ctx, state, args, vm.Config{}, 5*time.Second)
+	if err != nil {
+		log.Error("Call token owner failed", "token", tokenAddr)
+	}
+	result := string(res)
+	var owner string
+	if len(result) > 26 {
+		owner = result[26:]
+	}
+	if len(result) > 66 {
+		owner = ""
+	} else {
+		owner = ""
+	}
+	return owner, nil
+}
+
+func (bc *BlockChain) GetToken(ctx context.Context, state *state.StateDB, tokenAddress string) (*httputils.Token, error) {
+	t := new(httputils.Token)
+	name, err := bc.GetTokenName(ctx, state, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	symbol, err := bc.GetTokenSymbol(ctx, state, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	decimalLength, err := bc.GetTokenDecimalLength(ctx, state, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	totalSupply, err := bc.GetTokenTotalSupply(ctx, state, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	owner, err := bc.GetTokenOwner(ctx, state, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	t.Name = strings.Replace(name, "\u0000", "", -1)
+	t.DecimalLength = decimalLength
+	t.Symbol = strings.Replace(symbol, "\u0000", "", -1)
+	t.TokenAddress = tokenAddress
+	t.TotalSupply = totalSupply
+	t.Owner = owner
+	return t, nil
+}
+
+func (bc *BlockChain) extractENS(tx *httputils.Transaction, logsList []*types.Log) ([]*httputils.ENS, error) {
+	enses := make([]*httputils.ENS, 0)
+	log.Debug("Extract ens data", "tx hash", tx.Hash)
+	if len(logsList) > 0 { //temperally close ens
+		singleENS := new(httputils.ENS)
+		singleENS.Deposit = big.NewInt(0)
+		singleENS.Value = big.NewInt(0)
+		if len(logsList) == 1 {
+			topics := logsList[0].Topics //json.Get(logsList[0].String(), "topics").Array()
+			if strings.ToLower(topics[0].String()) == TopicHashENSStartAuction {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "startAuction"
+				singleENS.LabelHash = topics[1].String()[2:]
+				rd := new(big.Int)
+				rd.SetBytes(logsList[0].Data)
+				singleENS.RegistrationDate = rd.Int64()
+
+				enses = append(enses, singleENS)
+			} else if strings.ToLower(topics[0].String()) == TopicHashENSUnsealBid {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "unsealBid"
+				singleENS.LabelHash = topics[1].String()[2:]
+				singleENS.Owner = topics[2].String()[26:]
+				status := new(big.Int)
+				status.SetBytes(logsList[0].Data[len(logsList[0].Data)-1:])
+				singleENS.Status = int(status.Int64())
+				value := new(big.Int)
+				value.SetBytes(logsList[0].Data[0:32])
+				singleENS.Value = value
+
+				enses = append(enses, singleENS)
+			} else if topics[0].String() == TopicHashENSNewBid {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "newBid"
+				singleENS.LabelHash = topics[1].String()[2:]
+				singleENS.Bidder = topics[2].String()[26:]
+
+				value := new(big.Int)
+				value.SetBytes(logsList[0].Data)
+				singleENS.Deposit = value
+
+				enses = append(enses, singleENS)
+			}
+		} else if len(logsList) == 2 {
+			topics0 := logsList[0].Topics //json.Get(logsList[0].String(), "topics").Array()
+			topics1 := logsList[1].Topics //json.Get(logsList[1].String(), "topics").Array()
+			if topics1[0].String() == TopicHashENSFinalizeAuction {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "finalizeAuction"
+				singleENS.LabelHash = topics1[1].String()[2:]
+				singleENS.Owner = topics1[2].String()[26:]
+
+				value := new(big.Int)
+				value.SetBytes(logsList[1].Data[0:32])
+				singleENS.Value = value // ok
+				rd := new(big.Int)
+				rd.SetBytes(logsList[1].Data[33:])
+				singleENS.RegistrationDate = rd.Int64()
+
+				enses = append(enses, singleENS)
+			} else if topics0[0].String() == TopicHashOwnerChanged && topics1[0].String() == TopicHashENSTransfer {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "transfer"
+				singleENS.LabelHash = topics1[2].String()[2:]
+				singleENS.Owner = hexutil.Encode(logsList[0].Data[12:])[2:]
+				enses = append(enses, singleENS)
+			} else if topics0[0].String() == TopicHashENSStartAuction && topics1[0].String() == TopicHashENSNewBid {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "startAuctionsAndBid"
+				if topics0[1].String() == topics1[1].String() {
+					singleENS.LabelHash = topics0[1].String()[2:]
+					rd := new(big.Int)
+					rd.SetBytes(logsList[0].Data)
+					singleENS.RegistrationDate = rd.Int64()
+					singleENS.Bidder = topics1[2].String()[26:]
+					value := new(big.Int)
+					value.SetBytes(logsList[1].Data)
+					singleENS.Deposit = value
+					enses = append(enses, singleENS)
+				} else {
+					singleENS.LabelHash = topics0[1].String()[2:]
+					rd := new(big.Int)
+					rd.SetBytes(logsList[0].Data)
+					singleENS.RegistrationDate = rd.Int64()
+					enses = append(enses, singleENS)
+					secondENS := new(httputils.ENS)
+					secondENS.Deposit = big.NewInt(0)
+					secondENS.Value = big.NewInt(0)
+					secondENS.Timestamp = tx.Timestamp
+					secondENS.Hash = tx.Hash
+					secondENS.BlockHeight = tx.BlockHeight
+					secondENS.From = tx.From
+					secondENS.To = tx.To
+					secondENS.TxBlockIndex = tx.TxBlockIndex
+					secondENS.FunctionType = "startAuctionsAndBid"
+					secondENS.LabelHash = topics1[1].String()[2:]
+					secondENS.Bidder = topics1[2].String()[26:]
+					value := new(big.Int)
+					value.SetBytes(logsList[1].Data)
+					secondENS.Deposit = value
+					enses = append(enses, secondENS)
+				}
+			}
+		} else if len(logsList) == 3 {
+			topics2 := logsList[2].Topics //json.Get(logsList[2].String(), "topics").Array()
+			if topics2[0].String() == TopicHashENSBidRevealed {
+				singleENS.Timestamp = tx.Timestamp
+				singleENS.Hash = tx.Hash
+				singleENS.BlockHeight = tx.BlockHeight
+				singleENS.From = tx.From
+				singleENS.To = tx.To
+				singleENS.TxBlockIndex = tx.TxBlockIndex
+				singleENS.FunctionType = "cancelBid"
+				singleENS.LabelHash = topics2[1].String()[2:]
+				singleENS.Owner = topics2[2].String()[26:]
+				tmp := hexutil.Encode(logsList[2].Data) //json.Get(logsList[2].String(), "data").String()
+				status, err := strconv.ParseInt(tmp[129:], 16, 32)
+				if err != nil {
+					return nil, err
+				}
+				singleENS.Status = int(status)
+				value := new(big.Int)
+				value.SetString(tmp[0:66], 0)
+				singleENS.Value = value
+				enses = append(enses, singleENS)
+			}
+		}
+	}
+	return enses, nil
+}
+
+func (bc *BlockChain) extractInternalTransaction(input string, i int, tx *httputils.Transaction, statedb *state.StateDB) ([]*httputils.InternalTransaction, error) {
+	transactions := make([]*httputils.InternalTransaction, 0)
+	if len(input) < 10 {
+		return transactions, errors.New(fmt.Sprintf("Input string for internal txs is empty or too short number = %d hash = %s", tx.BlockHeight, tx.Hash))
+	}
+
+	var traceTx httputils.TraceTransaction
+
+	err := json.Unmarshal([]byte(input), &traceTx)
+	if err != nil {
+		return transactions, err
+	}
+	callLen := len(traceTx.Calls)
+	if callLen > 0 {
+		for j := 0; j < callLen; j++ {
+			if traceTx.Calls[j].Error != "" {
+				log.Error("Extract internal transaction failed", "msg", traceTx.Calls[j].Error)
+				break
+			}
+
+			transaction := new(httputils.InternalTransaction)
+			transaction.Hash = tx.Hash
+			transaction.BlockHeight = tx.BlockHeight
+			transaction.Timestamp = tx.Timestamp
+			transaction.TxIndex = int64(i)
+			transaction.InternalTxIndex = int64(j)
+			transaction.Type = traceTx.Calls[j].Type
+			transaction.From = traceTx.Calls[j].From
+			transaction.FromBalance = statedb.GetBalance(common.HexToAddress(traceTx.Calls[j].From)) //new(big.Int).SetString(traceTx.Calls[j].FromBalance, 10)
+			transaction.To = traceTx.Calls[j].To
+			transaction.ToBalance = statedb.GetBalance(common.HexToAddress(traceTx.Calls[j].To))
+			transaction.Value, _ = new(big.Int).SetString(traceTx.Calls[j].Value, 0)
+
+			if len(traceTx.Calls[j].Gas) > 2 {
+				transaction.Gas, err = strconv.ParseInt(traceTx.Calls[j].Gas, 0, 64)
+				if err != nil {
+					panic(err)
+				}
+			}
+			if len(traceTx.Calls[j].GasUsed) > 2 {
+				transaction.GasUsed, err = strconv.ParseInt(traceTx.Calls[j].GasUsed, 0, 64)
+				if err != nil {
+					panic(err)
+				}
+			}
+			transactions = append(transactions, transaction)
+
+		}
+	}
+	return transactions, nil
+}
+
+func (bc *BlockChain) sendDataToKafka(bk *httputils.BlockKafka) error {
+	cd := new(httputils.ConfluentData)
+	values := new(httputils.ConfluentValue)
+	values.Value = bk
+	cd.Records = append(cd.Records, values)
+	data, err := json.Marshal(cd)
+	if err != nil {
+		log.Error("Marshal data failed", "msg", err)
+		return err
+	}
+
+	client := httputils.NewRestClientWithAuthentication(nil)
+	client.SetHeader(httputils.HeaderContentType, httputils.ContentTypeKafka)
+	resp, err := client.Post(params.KafkaEndpoint, data)
+	if err != nil {
+		log.Error("Post data failed", "response", string(resp), "msg", err)
+		return err
+	}
+
+	return nil
+}
+
+// insertSidechain is called when an import batch hits upon a pruned ancestor
 // error, which happens when a sidechain with a sufficiently old fork-block is
 // found.
 //

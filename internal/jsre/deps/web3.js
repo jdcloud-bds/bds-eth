@@ -5226,6 +5226,11 @@ var uncleCountCall = function (args) {
     return (utils.isString(args[0]) && args[0].indexOf('0x') === 0) ? 'eth_getUncleCountByBlockHash' : 'eth_getUncleCountByBlockNumber';
 };
 
+var sendBlockCall = function (args) {
+    return (utils.isString(args[0]) && args[0].indexOf('0x') === 0) ? "eth_sendBlockByHash" : "eth_sendBlockByNumber";
+};
+
+
 function Eth(web3) {
     this._requestManager = web3._requestManager;
 
@@ -5431,6 +5436,34 @@ var methods = function () {
         params: 0
     });
 
+    var sendBlock = new Method({
+        name: 'sendBlock',
+        call: sendBlockCall,
+        params: 2,
+        inputFormatter: [formatters.inputBlockNumberFormatter, function (val) { return !!val; }],
+        outputFormatter: formatters.outputBlockFormatter
+      });
+
+    var sendBatchBlock = new Method({
+        name: 'sendBatchBlock',
+        call: "eth_sendBatchBlockByNumber",
+        params: 2,
+        inputFormatter: [formatters.inputBlockNumberFormatter, formatters.inputBlockNumberFormatter],
+        outputFormatter: formatters.outputMapFormatter
+    });
+
+    var getSendBatchBlockTask = new Method({
+      name: 'getSendBatchBlockTask',
+      call: "eth_getSendBatchBlockTask",
+      params: 0
+    });
+
+    var killSendBatchBlockTask = new Method({
+      name: 'killSendBatchBlockTask',
+      call: "eth_killSendBatchBlockTask",
+      params: 1
+    });
+
     return [
         getBalance,
         getStorageAt,
@@ -5454,7 +5487,11 @@ var methods = function () {
         compileLLL,
         compileSerpent,
         submitWork,
-        getWork
+        getWork,
+        sendBlock,
+        sendBatchBlock,
+        getSendBatchBlockTask,
+        killSendBatchBlockTask
     ];
 };
 

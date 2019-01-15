@@ -196,7 +196,7 @@ type storageblock struct {
 // changes to header and to the field values will not affect the
 // block.
 //
-// The values of TxHash, UncleHash, ReceiptHash and Bloom in header
+// The values of TransactionHash, UncleHash, ReceiptHash and Bloom in header
 // are ignored and set to values derived from the given txs, uncles
 // and receipts.
 func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*Receipt) *Block {

@@ -290,12 +290,15 @@ type Tracer struct {
 	contractWrapper *contractWrapper // Wrapper around the contract object
 	dbWrapper       *dbWrapper       // Wrapper around the VM environment
 
-	pcValue     *uint   // Swappable pc value wrapped by a log accessor
-	gasValue    *uint   // Swappable gas value wrapped by a log accessor
-	costValue   *uint   // Swappable cost value wrapped by a log accessor
-	depthValue  *uint   // Swappable depth value wrapped by a log accessor
-	errorValue  *string // Swappable error value wrapped by a log accessor
-	refundValue *uint   // Swappable refund value wrapped by a log accessor
+	pcValue     *uint    // Swappable pc value wrapped by a log accessor
+	gasValue    *uint    // Swappable gas value wrapped by a log accessor
+	costValue   *uint    // Swappable cost value wrapped by a log accessor
+	depthValue  *uint    // Swappable depth value wrapped by a log accessor
+	errorValue  *string  // Swappable error value wrapped by a log accessor
+	refundValue *uint    // Swappable refund value wrapped by a log accessor
+	timestamp   *uint    // Swappable timestamp value wrapped by a log accessor
+	fromBalance *big.Int // Swappable from balance  value wrapped by a log accessor
+	toBalance   *big.Int // Swappable to balance value wrapped by a log accessor
 
 	ctx map[string]interface{} // Transaction context gathered throughout execution
 	err error                  // Error, if one has occurred
@@ -325,6 +328,9 @@ func New(code string) (*Tracer, error) {
 		costValue:       new(uint),
 		depthValue:      new(uint),
 		refundValue:     new(uint),
+		timestamp:       new(uint),
+		fromBalance:     new(big.Int),
+		toBalance:       new(big.Int),
 	}
 	// Set up builtins for this environment
 	tracer.vm.PushGlobalGoFunction("toHex", func(ctx *duktape.Context) int {
@@ -517,7 +523,7 @@ func wrapError(context string, err error) error {
 }
 
 // CaptureStart implements the Tracer interface to initialize the tracing operation.
-func (jst *Tracer) CaptureStart(from common.Address, to common.Address, create bool, input []byte, gas uint64, value *big.Int) error {
+func (jst *Tracer) CaptureStart(from common.Address, to common.Address, create bool, input []byte, gas uint64, value *big.Int, fromBalance *big.Int, toBalance *big.Int, timestamp uint64) error {
 	jst.ctx["type"] = "CALL"
 	if create {
 		jst.ctx["type"] = "CREATE"
@@ -527,6 +533,10 @@ func (jst *Tracer) CaptureStart(from common.Address, to common.Address, create b
 	jst.ctx["input"] = input
 	jst.ctx["gas"] = gas
 	jst.ctx["value"] = value
+
+	jst.ctx["timestamp"] = timestamp
+	jst.ctx["fromBalance"] = fromBalance
+	jst.ctx["toBalance"] = toBalance
 
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -79,6 +80,56 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles())
 
 	return receipts, allLogs, *usedGas, nil
+}
+
+func (p *StateProcessor) ProcessWithTrace(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, []*types.TraceResult, uint64, error) {
+	var (
+		receipts     types.Receipts
+		usedGas      = new(uint64)
+		header       = block.Header()
+		allLogs      []*types.Log
+		traceResults []*types.TraceResult
+		gp           = new(GasPool).AddGas(block.GasLimit())
+		tracer       vm.Tracer
+		err          error
+	)
+	// Mutate the block and state according to any hard-fork specs
+	if p.config.DAOForkSupport && p.config.DAOForkBlock != nil && p.config.DAOForkBlock.Cmp(block.Number()) == 0 {
+		misc.ApplyDAOHardFork(statedb)
+	}
+	// Iterate over and process the individual transactions
+	for i, tx := range block.Transactions() {
+		tracer, err = tracers.New("callTracer")
+		if err != nil {
+			return nil, nil, nil, 0, err
+		}
+		cfg.Tracer = tracer
+		cfg.Debug = true
+
+		statedb.Prepare(tx.Hash(), block.Hash(), i)
+		receipt, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)
+		if err != nil {
+			return nil, nil, nil, 0, err
+		}
+		receipts = append(receipts, receipt)
+		allLogs = append(allLogs, receipt.Logs...)
+
+		traceResult := new(types.TraceResult)
+		traceResult.TransactionHash = tx.Hash()
+
+		result, err := tracer.(*tracers.Tracer).GetResult()
+		if err != nil {
+			return nil, nil, nil, 0, err
+		}
+		traceResult.Result = result
+		traceResult.TransactionIndex = uint(i)
+		traceResult.BlockHash = block.Hash()
+		traceResults = append(traceResults, traceResult)
+	}
+	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
+	p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles())
+
+	return receipts, allLogs, traceResults, *usedGas, nil
 }
 
 // ApplyTransaction attempts to apply a transaction to the given state database

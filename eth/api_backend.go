@@ -19,6 +19,7 @@ package eth
 import (
 	"context"
 	"errors"
+	"github.com/ethereum/go-ethereum/log"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -129,6 +130,16 @@ func (b *EthAPIBackend) BlockByNumberOrHash(ctx context.Context, blockNrOrHash r
 		return block, nil
 	}
 	return nil, errors.New("invalid arguments; neither block nor hash specified")
+}
+
+func (b *EthAPIBackend) SendBlockToKafka(ctx context.Context, blk *types.Block, rcps types.Receipts) error {
+	signer := types.MakeSigner(b.eth.blockchain.Config(), blk.Number())
+	err := b.eth.blockchain.WriteDataToKafka(blk, rcps, signer, nil)
+	if err != nil {
+		log.Warn("Send data to kafka failed", "number", blk.Number(), "hash", blk.Hash())
+		return err
+	}
+	return nil
 }
 
 func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.Header, error) {

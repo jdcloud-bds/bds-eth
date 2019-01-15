@@ -94,6 +94,8 @@ type StateDB struct {
 	validRevisions []revision
 	nextRevisionId int
 
+	traceResult map[common.Hash]*types.TraceResult
+
 	// Measurements gathered during execution for debugging purposes
 	AccountReads   time.Duration
 	AccountHashes  time.Duration
@@ -120,6 +122,7 @@ func New(root common.Hash, db Database) (*StateDB, error) {
 		logs:                make(map[common.Hash][]*types.Log),
 		preimages:           make(map[common.Hash][]byte),
 		journal:             newJournal(),
+		traceResult:         make(map[common.Hash]*types.TraceResult),
 	}, nil
 }
 
@@ -152,7 +155,16 @@ func (s *StateDB) Reset(root common.Hash) error {
 	s.logSize = 0
 	s.preimages = make(map[common.Hash][]byte)
 	s.clearJournalAndRefund()
+	s.traceResult = make(map[common.Hash]*types.TraceResult)
 	return nil
+}
+
+func (s *StateDB) SetTraceRes(traceRes *types.TraceResult) {
+	s.traceResult[s.thash] = traceRes
+}
+
+func (s *StateDB) GetTraceRes(hash common.Hash) *types.TraceResult {
+	return s.traceResult[hash]
 }
 
 func (s *StateDB) AddLog(log *types.Log) {

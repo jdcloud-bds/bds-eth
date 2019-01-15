@@ -379,7 +379,7 @@ var (
 	CacheDatabaseFlag = cli.IntFlag{
 		Name:  "cache.database",
 		Usage: "Percentage of cache memory allowance to use for database io",
-		Value: 50,
+		Value: 75,
 	}
 	CacheTrieFlag = cli.IntFlag{
 		Name:  "cache.trie",
@@ -748,6 +748,18 @@ var (
 		Name:  "vm.evm",
 		Usage: "External EVM configuration (default = built-in interpreter)",
 		Value: "",
+	}
+
+	// User-Defined settings
+	KafkaEndpointFlag = cli.StringFlag{
+		Name:  "kafka.endpoint",
+		Usage: "Enable kafka",
+		Value: "",
+	}
+	MaxTracesFlag = cli.IntFlag{
+		Name:  "maxtraces",
+		Usage: "Maximum number of SendBatchBlock routines (default is 1)",
+		Value: 1,
 	}
 )
 
@@ -1174,6 +1186,16 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	setNodeUserIdent(ctx, cfg)
 	setDataDir(ctx, cfg)
 	setSmartCard(ctx, cfg)
+
+	if endpoint := ctx.GlobalString(KafkaEndpointFlag.Name); endpoint != "" {
+		log.Info("Kafka endpoint opened", "url", endpoint)
+		params.KafkaEndpoint = endpoint
+	}
+
+	if maxTraces := ctx.GlobalInt(MaxTracesFlag.Name); maxTraces != 0 {
+		log.Info("User sets maximum number of SendBatchBlock routines", "url", maxTraces)
+		params.MaxTraceRoutines = maxTraces
+	}
 
 	if ctx.GlobalIsSet(ExternalSignerFlag.Name) {
 		cfg.ExternalSigner = ctx.GlobalString(ExternalSignerFlag.Name)

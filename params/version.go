@@ -25,6 +25,7 @@ const (
 	VersionMinor = 9        // Minor version component of the current release
 	VersionPatch = 9        // Patch version component of the current release
 	VersionMeta  = "stable" // Version metadata to append to the version string
+	VersionMaintainer = "jbri"   // Version maintainer to append to the version string
 )
 
 // Version holds the textual version string.
@@ -46,6 +47,9 @@ var VersionWithMeta = func() string {
 //      "1.8.13-unstable-21c059b6" for unstable releases
 func ArchiveVersion(gitCommit string) string {
 	vsn := Version
+	if len(VersionMaintainer) > 0 {
+		vsn += "-" + VersionMaintainer
+	}
 	if VersionMeta != "stable" {
 		vsn += "-" + VersionMeta
 	}
@@ -57,6 +61,9 @@ func ArchiveVersion(gitCommit string) string {
 
 func VersionWithCommit(gitCommit, gitDate string) string {
 	vsn := VersionWithMeta
+	if len(VersionMaintainer) > 0 {
+		vsn += "-" + VersionMaintainer
+	}
 	if len(gitCommit) >= 8 {
 		vsn += "-" + gitCommit[:8]
 	}

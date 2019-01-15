@@ -145,6 +145,8 @@ var (
 		utils.GpoPercentileFlag,
 		utils.EWASMInterpreterFlag,
 		utils.EVMInterpreterFlag,
+		utils.KafkaEndpointFlag,
+		utils.MaxTracesFlag,
 		configFileFlag,
 	}
 
@@ -233,6 +235,7 @@ func init() {
 	app.Flags = append(app.Flags, metricsFlags...)
 
 	app.Before = func(ctx *cli.Context) error {
+		runtime.GOMAXPROCS(runtime.NumCPU())
 		return debug.Setup(ctx, "")
 	}
 	app.After = func(ctx *cli.Context) error {

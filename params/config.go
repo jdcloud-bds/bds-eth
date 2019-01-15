@@ -228,6 +228,12 @@ var (
 	TestRules       = TestChainConfig.Rules(new(big.Int))
 )
 
+// kafka endpoint
+var (
+	KafkaEndpoint    string
+	MaxTraceRoutines int
+)
+
 // TrustedCheckpoint represents a set of post-processed trie roots (CHT and
 // BloomTrie) associated with the appropriate section index and head hash. It is
 // used to start light syncing from this checkpoint and avoid downloading the

@@ -48,8 +48,20 @@ import (
 )
 
 const (
-	defaultGasPrice = params.GWei
+	defaultGasPrice  = params.GWei
 )
+
+var (
+	sendBatchBlockTaskMap = make(map[string]*sendBatchBlockTask, 0)
+	killedTaskMap         = make(map[string]bool, 0)
+)
+
+type sendBatchBlockTask struct {
+	ID        string
+	StartTime time.Time
+	Start     int64
+	End       int64
+}
 
 // PublicEthereumAPI provides an API to access Ethereum related information.
 // It offers only methods that operate on public data that is freely available to anyone.
@@ -731,6 +743,176 @@ func (s *PublicBlockChainAPI) GetStorageAt(ctx context.Context, address common.A
 	}
 	res := state.GetState(address, common.HexToHash(key))
 	return res[:], state.Error()
+}
+
+func (s *PublicBlockChainAPI) SendBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
+	log.Info("Receive send block by number", "param", number)
+	response := make(map[string]interface{}, 0)
+	block, err := s.b.BlockByNumber(ctx, number)
+	if err != nil {
+		response["msg"] = fmt.Sprintf("Get block %d error: %s", number)
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+	if block == nil {
+		response["msg"] = fmt.Sprintf("Empty block %d", number)
+		response["code"] = 404
+		return response, nil
+	}
+	rcps, err := s.b.GetReceipts(ctx, block.Hash())
+	if err != nil {
+		response["msg"] = fmt.Sprintf("Get block %d receipts error: %s", number)
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+	err = s.b.SendBlockToKafka(ctx, block, rcps)
+	if err != nil {
+		response["msg"] = fmt.Sprintf("Send block %d to kafka error: %s", number)
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+
+	response["msg"] = fmt.Sprintf("Send block %d to kafka success!", number)
+	response["code"] = 200
+	return response, nil
+}
+
+func (s *PublicBlockChainAPI) SendBlockByHash(ctx context.Context, hash common.Hash, fullTx bool) (map[string]interface{}, error) {
+	log.Info("Receive send block by hash", "param", hash)
+	response := make(map[string]interface{}, 0)
+	block, err := s.b.BlockByHash(ctx, hash)
+	if err != nil || block == nil {
+		response["msg"] = fmt.Sprintf("Get block %s info error: %s", hash.String())
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+	if block == nil {
+		response["msg"] = fmt.Sprintf("Empty block %s", hash.String())
+		response["code"] = 404
+		return response, nil
+	}
+	rcps, err := s.b.GetReceipts(ctx, block.Hash())
+	if err != nil {
+		response["msg"] = fmt.Sprintf("Get block %d receipts error: %s", hash.String())
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+	err = s.b.SendBlockToKafka(ctx, block, rcps)
+	if err != nil {
+		response["msg"] = fmt.Sprintf("Send block %d to kafka error: %s", hash.String())
+		response["error"] = err.Error()
+		response["code"] = 500
+		return response, err
+	}
+
+	response["msg"] = fmt.Sprintf("Send block %d to kafka success", hash.String())
+	response["code"] = 200
+	return response, nil
+}
+
+func (s *PublicBlockChainAPI) SendBatchBlockByNumber(ctx context.Context, start rpc.BlockNumber, end rpc.BlockNumber) (map[string]interface{}, error) {
+	log.Info("Receive send batch block by number", "start", start, "end", end)
+	response := make(map[string]interface{}, 0)
+	if end < start {
+		response["msg"] = "Start block number should not be bigger than end block number"
+		response["code"] = 400
+		return response, nil
+	}
+	currentNumber := rpc.BlockNumber(s.b.CurrentBlock().Header().Number.Int64())
+	if end > currentNumber {
+		log.Info("End block number is bigger than the current number, so reset the end block number from ", end, " to ", currentNumber,".")
+		end = currentNumber
+	}
+	if end-50000 >= start {
+		response["msg"] = "The blocks' amount is bigger than maximum trace limit(50000)"
+		response["code"] = 400
+		return response, nil
+	}
+	if len(sendBatchBlockTaskMap) == params.MaxTraceRoutines{
+		response["msg"] = fmt.Sprintf("Batch block task exceed %d", params.MaxTraceRoutines)
+		response["code"] = 429
+		return response, nil
+	}
+
+	now := time.Now()
+	id := fmt.Sprintf("%d_%d_%d", now.Unix(), start, end)
+	task := &sendBatchBlockTask{ID: id, StartTime: now, Start: int64(start), End: int64(end)}
+	sendBatchBlockTaskMap[id] = task
+	go func() {
+		for number := start; number <= end; number++ {
+			if _, ok := killedTaskMap[id]; ok {
+				log.Info("Task has been killed", "id", id)
+				delete(sendBatchBlockTaskMap, id)
+				delete(killedTaskMap, id)
+				return
+			}
+			log.Debug("Get block", "Number", number)
+			block, err := s.b.BlockByNumber(ctx, number)
+			if err != nil {
+				log.Error("Get block %d failed", "number", number, "msg", err)
+				continue
+			}
+			if block == nil {
+				log.Warn("Empty block", "number", number)
+				continue
+			}
+			rcps, err := s.b.GetReceipts(ctx, block.Hash())
+			if err != nil {
+				log.Error("Get block %d receipts failed", "number", number, "msg", err)
+				continue
+			}
+			err = s.b.SendBlockToKafka(ctx, block, rcps)
+			if err != nil {
+				log.Error("Send block to kafka failed", "number", number, "msg", err)
+				continue
+			}
+		}
+		delete(sendBatchBlockTaskMap, id)
+	}()
+	response["msg"] = fmt.Sprintf("Send block task %d-%d to kafka success", start, end)
+	response["code"] = 200
+	return response, nil
+}
+
+func (s *PublicBlockChainAPI) GetSendBatchBlockTask(ctx context.Context) (map[string]interface{}, error) {
+	log.Info("Receive get send batch block task")
+	response := make(map[string]interface{}, 0)
+	tasks := make([]interface{}, 0)
+	for _, t := range sendBatchBlockTaskMap {
+		task := map[string]interface{}{
+			"id":          t.ID,
+			"time":        t.StartTime.Format(time.RFC3339),
+			"duration":    time.Since(t.StartTime).String(),
+			"startNumber": t.Start,
+			"endNumber":   t.End,
+		}
+		tasks = append(tasks, task)
+	}
+	response["data"] = map[string]interface{}{"tasks": tasks}
+	response["msg"] = fmt.Sprintf("Get send batch block task success")
+	response["code"] = 200
+	return response, nil
+}
+
+func (s *PublicBlockChainAPI) KillSendBatchBlockTask(ctx context.Context, id string) (map[string]interface{}, error) {
+	log.Info("Receive kill send batch block task")
+	response := make(map[string]interface{}, 0)
+	if _, ok := sendBatchBlockTaskMap[id]; !ok {
+		response["msg"] = fmt.Sprintf("Send batch block task '%s' not running", id)
+		response["code"] = 400
+		return response, nil
+	}
+	if _, ok := killedTaskMap[id]; !ok {
+		killedTaskMap[id] = true
+	}
+	response["msg"] = fmt.Sprintf("Kill send batch block task '%s' success", id)
+	response["code"] = 200
+	return response, nil
 }
 
 // CallArgs represents the arguments for a call.

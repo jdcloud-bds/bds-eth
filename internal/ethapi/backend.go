@@ -84,6 +84,7 @@ type Backend interface {
 
 	ChainConfig() *params.ChainConfig
 	CurrentBlock() *types.Block
+	SendBlockToKafka(ctx context.Context, blk *types.Block, rcps types.Receipts) error
 }
 
 func GetAPIs(apiBackend Backend) []rpc.API {
