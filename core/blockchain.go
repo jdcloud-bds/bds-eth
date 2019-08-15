@@ -1703,10 +1703,12 @@ func (bc *BlockChain) WriteDataToKafka(blk *types.Block, rcps types.Receipts, si
 	}
 
 	if params.KafkaEndpoint != "" {
-		if b.Block.Height == 1 && traceResult != nil {
+		if b.Block.Height == 1 {
+		//if b.Block.Height == 1 && traceResult != nil {
 			block := bc.setupGenesisBlock()
 			if block != nil {
 				_ = bc.sendDataToKafka(block)
+				log.Info("Send data to kafka success", "number", block.Block.Height, "hash", block.Block.Hash)
 			}
 		}
 		if b.Block.Height == 0 {
